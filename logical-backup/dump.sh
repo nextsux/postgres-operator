@@ -150,6 +150,23 @@ function gcs_upload {
     gsutil -o Credentials:gs_service_key_file=$LOGICAL_BACKUP_GOOGLE_APPLICATION_CREDENTIALS cp - "$PATH_TO_BACKUP"
 }
 
+function aws_upload_file {
+    local file_path=$1
+    local db_name=$2
+    local expected_size=$3
+
+    # mimic bucket setup from Spilo
+    PATH_TO_BACKUP=s3://$LOGICAL_BACKUP_S3_BUCKET"/"$LOGICAL_BACKUP_S3_BUCKET_PREFIX"/"$SCOPE$LOGICAL_BACKUP_S3_BUCKET_SCOPE_SUFFIX"/logical_backups/${TIMESTAMP}_${db_name}.sql.gz"
+
+    args=()
+
+    [[ ! -z "$LOGICAL_BACKUP_S3_ENDPOINT" ]] && args+=("--endpoint-url=$LOGICAL_BACKUP_S3_ENDPOINT")
+    [[ ! -z "$LOGICAL_BACKUP_S3_REGION" ]] && args+=("--region=$LOGICAL_BACKUP_S3_REGION")
+    [[ ! -z "$LOGICAL_BACKUP_S3_SSE" ]] && args+=("--sse=$LOGICAL_BACKUP_S3_SSE")
+
+    aws s3 cp "$file_path" "$PATH_TO_BACKUP" "${args[@]//\'/}"
+}
+
 function upload {
     local db_name=$1
     local estimated_size=$2
@@ -220,8 +237,13 @@ if [ "$LOGICAL_BACKUP_PROVIDER" == "az" ]; then
     az_upload /tmp/azure-backup-globals.sql.gz "globals"
     [[ ${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0 ]] && (( ERRORCOUNT += 1 ))
 else
-    dump_globals | compress | upload "globals" "$ESTIMATED_SIZE_PER_DB"
-    [[ ${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0 || ${PIPESTATUS[2]} != 0 ]] && (( ERRORCOUNT += 1 ))
+    # Create temporary file to prevent streaming issues with S3
+    TEMP_FILE="/tmp/backup-globals.sql.gz"
+    dump_globals | compress > "$TEMP_FILE"
+    # Use file-based upload instead of streaming
+    aws_upload_file "$TEMP_FILE" "globals" "$ESTIMATED_SIZE_PER_DB"
+    [[ $? != 0 ]] && (( ERRORCOUNT += 1 ))
+    rm -f "$TEMP_FILE"
 fi
 
 # Then dump and upload each database
@@ -231,8 +253,13 @@ for db in $(list_databases); do
         az_upload "/tmp/azure-backup-${db}.sql.gz" "$db"
         [[ ${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0 ]] && (( ERRORCOUNT += 1 ))
     else
-        dump_database "$db" | compress | upload "$db" "$ESTIMATED_SIZE_PER_DB"
-        [[ ${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0 || ${PIPESTATUS[2]} != 0 ]] && (( ERRORCOUNT += 1 ))
+        # Create temporary file to prevent streaming issues with S3
+        TEMP_FILE="/tmp/backup-${db}.sql.gz" 
+        dump_database "$db" | compress > "$TEMP_FILE"
+        # Use file-based upload instead of streaming
+        aws_upload_file "$TEMP_FILE" "$db" "$ESTIMATED_SIZE_PER_DB"
+        [[ $? != 0 ]] && (( ERRORCOUNT += 1 ))
+        rm -f "$TEMP_FILE"
     fi
 done
 
