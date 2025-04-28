@@ -7,9 +7,11 @@ set -o pipefail
 IFS=$'\n\t'
 
 ALL_DB_SIZE_QUERY="select sum(pg_database_size(datname)::numeric) from pg_database;"
+LIST_DB_QUERY="SELECT datname FROM pg_database WHERE datistemplate = false AND datname != 'postgres';"
 PG_BIN=$PG_DIR/$PG_VERSION/bin
 DUMP_SIZE_COEFF=5
 ERRORCOUNT=0
+TIMESTAMP=$(date +%s)
 
 TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
 KUBERNETES_SERVICE_PORT=${KUBERNETES_SERVICE_PORT:-443}
@@ -35,9 +37,20 @@ function estimate_size {
     "$PG_BIN"/psql -tqAc "${ALL_DB_SIZE_QUERY}"
 }
 
-function dump {
-    # settings are taken from the environment
-    "$PG_BIN"/pg_dumpall
+function list_databases {
+    "$PG_BIN"/psql -tqAc "${LIST_DB_QUERY}"
+}
+
+function dump_globals {
+    # Dump global objects (roles, tablespaces)
+    echo "Dumping global objects..."
+    "$PG_BIN"/pg_dumpall --globals-only
+}
+
+function dump_database {
+    local db_name=$1
+    echo "Dumping database: $db_name"
+    "$PG_BIN"/pg_dump --dbname="$db_name" --create
 }
 
 function compress {
@@ -45,9 +58,12 @@ function compress {
 }
 
 function az_upload {
-    PATH_TO_BACKUP=$LOGICAL_BACKUP_S3_BUCKET"/"$LOGICAL_BACKUP_S3_BUCKET_PREFIX"/"$SCOPE$LOGICAL_BACKUP_S3_BUCKET_SCOPE_SUFFIX"/logical_backups/"$(date +%s).sql.gz
+    local file=$1
+    local db_name=$2
 
-    az storage blob upload --file "$1" --account-name "$LOGICAL_BACKUP_AZURE_STORAGE_ACCOUNT_NAME" --account-key "$LOGICAL_BACKUP_AZURE_STORAGE_ACCOUNT_KEY" -c "$LOGICAL_BACKUP_AZURE_STORAGE_CONTAINER" -n "$PATH_TO_BACKUP"
+    PATH_TO_BACKUP=$LOGICAL_BACKUP_S3_BUCKET"/"$LOGICAL_BACKUP_S3_BUCKET_PREFIX"/"$SCOPE$LOGICAL_BACKUP_S3_BUCKET_SCOPE_SUFFIX"/logical_backups/${TIMESTAMP}_${db_name}.sql.gz"
+
+    az storage blob upload --file "$file" --account-name "$LOGICAL_BACKUP_AZURE_STORAGE_ACCOUNT_NAME" --account-key "$LOGICAL_BACKUP_AZURE_STORAGE_ACCOUNT_KEY" -c "$LOGICAL_BACKUP_AZURE_STORAGE_CONTAINER" -n "$PATH_TO_BACKUP"
 }
 
 function aws_delete_objects {
@@ -87,8 +103,15 @@ function aws_delete_outdated {
     # list objects older than the cutoff date
     aws s3api list-objects "${args[@]}" --query="Contents[?LastModified<='$cutoff_date'].[Key]" > /tmp/outdated-backups
 
-    # spare the last backup
-    sed -i '$d' /tmp/outdated-backups
+    # spare the last backup per database
+    # group by database name and keep the newest one
+    if [ -s /tmp/outdated-backups ]; then
+        for db in $(list_databases); do
+            grep "_${db}.sql.gz$" /tmp/outdated-backups | sort | sed -i '$d' /tmp/outdated-backups
+        done
+        # Also handle globals backup
+        grep "_globals.sql.gz$" /tmp/outdated-backups | sort | sed -i '$d' /tmp/outdated-backups
+    fi
 
     count=$(wc -l < /tmp/outdated-backups)
     if [[ $count == 0 ]] ; then
@@ -102,16 +125,16 @@ function aws_delete_outdated {
 }
 
 function aws_upload {
-    declare -r EXPECTED_SIZE="$1"
+    local db_name=$1
+    local expected_size=$2
 
     # mimic bucket setup from Spilo
-    # to keep logical backups at the same path as WAL
     # NB: $LOGICAL_BACKUP_S3_BUCKET_SCOPE_SUFFIX already contains the leading "/" when set by the Postgres Operator
-    PATH_TO_BACKUP=s3://$LOGICAL_BACKUP_S3_BUCKET"/"$LOGICAL_BACKUP_S3_BUCKET_PREFIX"/"$SCOPE$LOGICAL_BACKUP_S3_BUCKET_SCOPE_SUFFIX"/logical_backups/"$(date +%s).sql.gz
+    PATH_TO_BACKUP=s3://$LOGICAL_BACKUP_S3_BUCKET"/"$LOGICAL_BACKUP_S3_BUCKET_PREFIX"/"$SCOPE$LOGICAL_BACKUP_S3_BUCKET_SCOPE_SUFFIX"/logical_backups/${TIMESTAMP}_${db_name}.sql.gz"
 
     args=()
 
-    [[ ! -z "$EXPECTED_SIZE" ]] && args+=("--expected-size=$EXPECTED_SIZE")
+    [[ ! -z "$expected_size" ]] && args+=("--expected-size=$expected_size")
     [[ ! -z "$LOGICAL_BACKUP_S3_ENDPOINT" ]] && args+=("--endpoint-url=$LOGICAL_BACKUP_S3_ENDPOINT")
     [[ ! -z "$LOGICAL_BACKUP_S3_REGION" ]] && args+=("--region=$LOGICAL_BACKUP_S3_REGION")
     [[ ! -z "$LOGICAL_BACKUP_S3_SSE" ]] && args+=("--sse=$LOGICAL_BACKUP_S3_SSE")
@@ -120,19 +143,23 @@ function aws_upload {
 }
 
 function gcs_upload {
-    PATH_TO_BACKUP=gs://$LOGICAL_BACKUP_S3_BUCKET"/"$LOGICAL_BACKUP_S3_BUCKET_PREFIX"/"$SCOPE$LOGICAL_BACKUP_S3_BUCKET_SCOPE_SUFFIX"/logical_backups/"$(date +%s).sql.gz
+    local db_name=$1
+
+    PATH_TO_BACKUP=gs://$LOGICAL_BACKUP_S3_BUCKET"/"$LOGICAL_BACKUP_S3_BUCKET_PREFIX"/"$SCOPE$LOGICAL_BACKUP_S3_BUCKET_SCOPE_SUFFIX"/logical_backups/${TIMESTAMP}_${db_name}.sql.gz"
 
     gsutil -o Credentials:gs_service_key_file=$LOGICAL_BACKUP_GOOGLE_APPLICATION_CREDENTIALS cp - "$PATH_TO_BACKUP"
 }
 
 function upload {
+    local db_name=$1
+    local estimated_size=$2
+
     case $LOGICAL_BACKUP_PROVIDER in
         "gcs")
-            gcs_upload
+            gcs_upload "$db_name"
             ;;
         "s3")
-            aws_upload $(($(estimate_size) / DUMP_SIZE_COEFF))
-            aws_delete_outdated
+            aws_upload "$db_name" "$estimated_size"
             ;;
     esac
 }
@@ -173,24 +200,46 @@ CURRENT_NODENAME=$(get_current_pod | jq .items[].spec.nodeName --raw-output)
 export CURRENT_NODENAME
 
 for search in "${search_strategy[@]}"; do
-
     PGHOST=$(eval "$search")
     export PGHOST
 
     if [ -n "$PGHOST" ]; then
         break
     fi
-
 done
 
 set -x
-if [ "$LOGICAL_BACKUP_PROVIDER" == "az" ]; then
-    dump | compress > /tmp/azure-backup.sql.gz
-    az_upload /tmp/azure-backup.sql.gz
-else
-    dump | compress | upload
-    [[ ${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0 || ${PIPESTATUS[2]} != 0 ]] && (( ERRORCOUNT += 1 ))
-    set +x
 
-    exit $ERRORCOUNT
+# Get the estimated total size for all databases
+TOTAL_ESTIMATED_SIZE=$(estimate_size)
+ESTIMATED_SIZE_PER_DB=$((TOTAL_ESTIMATED_SIZE / DUMP_SIZE_COEFF))
+
+# First dump and upload global objects
+if [ "$LOGICAL_BACKUP_PROVIDER" == "az" ]; then
+    dump_globals | compress > /tmp/azure-backup-globals.sql.gz
+    az_upload /tmp/azure-backup-globals.sql.gz "globals"
+    [[ ${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0 ]] && (( ERRORCOUNT += 1 ))
+else
+    dump_globals | compress | upload "globals" "$ESTIMATED_SIZE_PER_DB"
+    [[ ${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0 || ${PIPESTATUS[2]} != 0 ]] && (( ERRORCOUNT += 1 ))
 fi
+
+# Then dump and upload each database
+for db in $(list_databases); do
+    if [ "$LOGICAL_BACKUP_PROVIDER" == "az" ]; then
+        dump_database "$db" | compress > "/tmp/azure-backup-${db}.sql.gz"
+        az_upload "/tmp/azure-backup-${db}.sql.gz" "$db"
+        [[ ${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0 ]] && (( ERRORCOUNT += 1 ))
+    else
+        dump_database "$db" | compress | upload "$db" "$ESTIMATED_SIZE_PER_DB"
+        [[ ${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0 || ${PIPESTATUS[2]} != 0 ]] && (( ERRORCOUNT += 1 ))
+    fi
+done
+
+# Clean up outdated backups
+if [ "$LOGICAL_BACKUP_PROVIDER" == "s3" ]; then
+    aws_delete_outdated
+fi
+
+set +x
+exit $ERRORCOUNT
